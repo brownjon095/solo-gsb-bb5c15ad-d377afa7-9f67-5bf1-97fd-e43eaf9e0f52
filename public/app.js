@@ -1137,16 +1137,51 @@ function taskTransitionToast(snap, task, prevStatus) {
   return null;
 }
 
+/** 延期申请状态变化反馈：申请人收审批结果，主持人收到新申请/重复提交不打扰（卡片内可见） */
+function deadlineRequestToast(task, prevReq) {
+  const me = state.me;
+  if (!me) return null;
+  const isAssignee = task.assigneeId === me.id;
+  const req = task.deadlineRequest;
+  if (!req) return null;
+  if (!prevReq && req.status === 'pending' && me.host) {
+    return [`「${req.byNick}」申请将「${task.title}」延期`, 'info'];
+  }
+  if (prevReq && prevReq.status === 'pending' && req.status === 'approved' && isAssignee) {
+    return [`主持人已批准「${task.title}」的延期申请`, 'success'];
+  }
+  if (prevReq && prevReq.status === 'pending' && req.status === 'rejected' && isAssignee) {
+    return [`主持人拒绝了「${task.title}」的延期申请`, 'error'];
+  }
+  return null;
+}
+
 function processTasks(snap) {
   const seen = new Set();
   for (const task of snap.tasks || []) {
     seen.add(task.id);
     const prev = state.taskStatus.get(task.id);
-    if (state.taskSeeded && (!prev || prev.status !== task.status)) {
-      const outcome = taskTransitionToast(snap, task, prev ? prev.status : null);
-      if (outcome) toast(outcome[0], outcome[1]);
+    if (state.taskSeeded) {
+      if (!prev || prev.status !== task.status) {
+        const outcome = taskTransitionToast(snap, task, prev ? prev.status : null);
+        if (outcome) toast(outcome[0], outcome[1]);
+      }
+      const prevReq = prev ? prev.req : null;
+      const reqSig = task.deadlineRequest
+        ? `${task.deadlineRequest.id}:${task.deadlineRequest.status}`
+        : null;
+      if (reqSig && reqSig !== prevReq) {
+        const outcome = deadlineRequestToast(task, prev ? prev.reqObj : null);
+        if (outcome) toast(outcome[0], outcome[1]);
+      }
     }
-    state.taskStatus.set(task.id, { status: task.status });
+    state.taskStatus.set(task.id, {
+      status: task.status,
+      req: task.deadlineRequest
+        ? `${task.deadlineRequest.id}:${task.deadlineRequest.status}`
+        : null,
+      reqObj: task.deadlineRequest || null
+    });
   }
   // 清理已从快照消失（滚动淘汰）的本地记录
   for (const id of [...state.taskStatus.keys()]) {
@@ -1249,10 +1284,87 @@ function taskCard(t, pmap, closed) {
       <span>截止 ${formatDeadline(t.deadline)}</span>
       ${closed ? '' : `<span class="task-remain" data-deadline="${t.deadline}"></span>`}
     </div>
+    ${taskDeadlineBlock(t, closed)}
     ${last ? `<div class="task-history-line">${formatTime(last.ts)} · ${escapeHtml(last.byNick)} ${taskHistoryText(last)}</div>` : ''}
     ${actions}
   `;
   return li;
+}
+
+/**
+ * 延期申请区块：
+ * - 待审：展示申请人、申请的新截止时间与理由；主持人显示批准 / 拒绝按钮；
+ * - 已生效：展示新截止时间、审批人与审批时间；
+ * - 已拒绝：理由保留展示；
+ * - 负责人在待接受 / 处理中且无待审申请时，显示「申请延期」入口与内联表单。
+ */
+function taskDeadlineBlock(t, closed) {
+  const me = state.me;
+  const req = t.deadlineRequest;
+  if (req && req.status === 'pending') {
+    const isHost = !!(me && me.host);
+    return `
+      <div class="deadline-request dr-pending">
+        <div class="dr-head">
+          <span class="dr-tag dr-tag-pending">延期待审</span>
+          <span class="dr-meta">${escapeHtml(req.byNick)} 申请延至 <b>${formatDeadline(req.newDeadline)}</b></span>
+        </div>
+        <div class="dr-reason">理由：${escapeHtml(req.reason)}</div>
+        <div class="dr-meta dr-foot">${formatTime(req.ts)} 申请${
+          isHost
+            ? `
+          <span class="dr-actions">
+            <button class="btn btn-primary btn-mini" data-task-act="dr-approve" data-task-id="${t.id}">✅ 批准延期</button>
+            <button class="btn btn-ghost btn-mini" data-task-act="dr-reject" data-task-id="${t.id}">拒绝</button>
+          </span>`
+            : ''
+        }</div>
+      </div>`;
+  }
+  if (req && req.status === 'approved') {
+    return `
+      <div class="deadline-request dr-approved">
+        <div class="dr-head">
+          <span class="dr-tag dr-tag-approved">延期已生效</span>
+          <span class="dr-meta">截止时间已更新为 <b>${formatDeadline(req.newDeadline)}</b></span>
+        </div>
+        <div class="dr-reason">理由：${escapeHtml(req.reason)}</div>
+        <div class="dr-meta dr-foot">${escapeHtml(req.byNick)} 申请 · ${escapeHtml(req.reviewedNick || '主持人')} 于 ${formatTime(req.reviewedAt)} 批准</div>
+      </div>`;
+  }
+  if (req && req.status === 'rejected') {
+    return `
+      <div class="deadline-request dr-rejected">
+        <div class="dr-head">
+          <span class="dr-tag dr-tag-rejected">延期已拒绝</span>
+          <span class="dr-meta">申请延至 ${formatDeadline(req.newDeadline)}</span>
+        </div>
+        <div class="dr-reason">理由：${escapeHtml(req.reason)}</div>
+        <div class="dr-meta dr-foot">${escapeHtml(req.byNick)} 申请 · ${escapeHtml(req.reviewedNick || '主持人')} 于 ${formatTime(req.reviewedAt)} 拒绝</div>
+      </div>`;
+  }
+  // 负责人在可申请状态（待接受 / 处理中）显示申请入口；已被拒绝过可重新申请
+  if (!closed && me && me.id === t.assigneeId && (t.status === 'pending' || t.status === 'active')) {
+    return `
+      <div class="deadline-request-form-wrap" data-dr-form="${t.id}">
+        <div class="dr-entry">
+          <button class="btn btn-ghost btn-mini" type="button" data-task-act="dr-open" data-task-id="${t.id}">📅 申请延期</button>
+        </div>
+        <div class="deadline-request-form" hidden>
+          <label class="dr-field">
+            新截止时间
+            <input type="datetime-local" data-dr-deadline="${t.id}" />
+          </label>
+          <input type="text" class="dr-reason-input" maxlength="300"
+                 placeholder="延期理由（必填）" data-dr-reason="${t.id}" autocomplete="off" />
+          <div class="dr-form-actions">
+            <button class="btn btn-primary btn-mini" type="button" data-task-act="dr-submit" data-task-id="${t.id}">提交申请</button>
+            <button class="btn btn-ghost btn-mini" type="button" data-task-act="dr-cancel-form" data-task-id="${t.id}">取消</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  return '';
 }
 
 /** 未完结行动项的剩余时间随服务端校准时钟跳动，逾期红色醒目提示 */
@@ -1290,19 +1402,67 @@ els.taskForm.addEventListener('submit', (e) => {
   els.taskForm.classList.add('is-hidden');
 });
 
-// 行动项卡片操作：接受 / 拒绝 / 标记完成 / 确认完成 / 退回处理中
+// 行动项卡片操作：接受 / 拒绝 / 标记完成 / 确认完成 / 退回处理中 / 延期申请与审批
 els.taskGroups.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-task-act]');
   if (!btn) return;
+  const act = btn.dataset.taskAct;
+  const taskId = btn.dataset.taskId;
   const type = {
     accept: 'task_accept',
     reject: 'task_reject',
     complete: 'task_complete',
     confirm: 'task_confirm',
     return: 'task_return'
-  }[btn.dataset.taskAct];
-  if (!type) return;
-  sendCmd({ type, taskId: btn.dataset.taskId });
+  }[act];
+  if (type) {
+    sendCmd({ type, taskId });
+    return;
+  }
+  // 延期申请：展开 / 收起内联表单
+  if (act === 'dr-open') {
+    const wrap = btn.closest('.deadline-request-form-wrap');
+    if (!wrap) return;
+    const form = wrap.querySelector('.deadline-request-form');
+    form.hidden = false;
+    btn.closest('.dr-entry').hidden = true;
+    const task = (state.snapshot.tasks || []).find((t) => t.id === taskId);
+    const base = task ? Math.max(task.deadline, Date.now()) + 3600000 : Date.now() + 3600000;
+    const input = form.querySelector('input[data-dr-deadline]');
+    input.value = toLocalInputValue(base);
+    form.querySelector('input[data-dr-reason]').focus();
+    return;
+  }
+  if (act === 'dr-cancel-form') {
+    const wrap = btn.closest('.deadline-request-form-wrap');
+    if (!wrap) return;
+    wrap.querySelector('.deadline-request-form').hidden = true;
+    wrap.querySelector('.dr-entry').hidden = false;
+    return;
+  }
+  if (act === 'dr-submit') {
+    const task = (state.snapshot.tasks || []).find((t) => t.id === taskId);
+    if (!task) return;
+    const newDeadline = new Date(
+      document.querySelector(`input[data-dr-deadline="${CSS.escape(taskId)}"]`).value
+    ).getTime();
+    if (!Number.isFinite(newDeadline)) return toast('请选择有效的新截止时间', 'error');
+    if (newDeadline <= task.deadline) return toast('新的截止时间必须晚于当前截止时间', 'error');
+    const reason = document.querySelector(`input[data-dr-reason="${CSS.escape(taskId)}"]`).value.trim();
+    if (!reason) return toast('请填写延期理由', 'error');
+    sendCmd({ type: 'task_deadline_request', taskId, newDeadline, reason });
+    return;
+  }
+  // 主持人审批延期
+  if (act === 'dr-approve') {
+    if (!confirm('确定批准该延期申请？\n行动项截止时间将原子更新为申请的新时间。')) return;
+    sendCmd({ type: 'task_deadline_approve', taskId });
+    return;
+  }
+  if (act === 'dr-reject') {
+    if (!confirm('确定拒绝该延期申请？\n申请理由会保留在行动项卡片中。')) return;
+    sendCmd({ type: 'task_deadline_reject', taskId });
+  }
 });
 
 function renderLogs(snap) {

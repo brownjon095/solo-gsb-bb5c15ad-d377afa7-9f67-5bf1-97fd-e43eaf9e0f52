@@ -34,6 +34,9 @@
  *   { type: "task_complete",version, taskId }     // 负责人：标记完成（处理中 -> 待确认）
  *   { type: "task_confirm", version, taskId }     // 主持人：确认完成（待确认 -> 已完成）
  *   { type: "task_return",  version, taskId }     // 主持人：退回处理中（待确认 -> 处理中）
+ *   { type: "task_deadline_request", version, taskId, newDeadline, reason }  // 负责人：提交延期申请（仅待接受/处理中）
+ *   { type: "task_deadline_approve", version, taskId }  // 主持人：批准（原子更新 deadline 并标记已生效）
+ *   { type: "task_deadline_reject",  version, taskId }  // 主持人：拒绝（理由保留在申请记录中）
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -97,6 +100,17 @@
  * （BAD_TASK_STATE + 最新快照）——多端重复确认、越权跳转都会被拒绝且不
  * 改变版本。每个行动项保留最近 TASK_HISTORY_LIMIT 条状态变更记录（含操作者
  * 与时间）随快照下发；已完结行动项保留最近 TASK_RESOLVED_LIMIT 条滚动淘汰。
+ *
+ * 延期申请：负责人可对「待接受 / 处理中」的行动项提交新的截止时间（ms 时间戳）
+ * 与申请理由（task_deadline_request），同一行动项同一时刻仅保留一条待审申请，
+ * 重复提交返回 DEADLINE_REQUEST_PENDING。主持人可批准（task_deadline_approve，
+ * 在同一次同步状态变更内原子更新 deadline 并把申请标记为 approved/已生效）或
+ * 拒绝（task_deadline_reject，申请记录与理由保留为 rejected）。申请、批准、
+ * 拒绝命令均携带 version，过期返回 STALE_VERSION + 最新快照；非待审申请的
+ * 审批返回 DEADLINE_REQUEST_NOT_PENDING。批准/拒绝后申请记录随行动项保留
+ * （approved/rejected 不滚动淘汰），行动项进入待确认/已完结状态时仅清退
+ * 待审申请。快照随每个行动项下发 deadlineRequest（无申请时为 null），
+ * 申请与审批操作均写入操作记录（含申请人/审批人及时间）。
  * 行动项无定时任务，断线重连后凭快照完整恢复。
  */
 
@@ -140,6 +154,8 @@ const TASK_RESOLVED_LIMIT = parseInt(process.env.TASK_RESOLVED_LIMIT, 10) || 50;
 // 行动项：未完结（待接受/处理中/待确认）数量上限
 const TASK_MAX_OPEN = parseInt(process.env.TASK_MAX_OPEN, 10) || 100;
 const TASK_TITLE_MAX = 120;
+// 延期申请理由的最大长度
+const TASK_DEADLINE_REASON_MAX = 300;
 // 行动项截止时间：容忍客户端时钟偏差，过去 5 分钟内的截止时间仍视为有效
 const TASK_DEADLINE_GRACE_MS = 5 * 60 * 1000;
 // 行动项截止时间最远可设为 366 天后
@@ -210,7 +226,13 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     createdAt, deadline,  // 创建时间与截止时间（ms 时间戳）
  *     status,               // pending(待接受)|active(处理中)|review(待确认)|done(已完成)|rejected(已拒绝)
  *     updatedAt,            // 最近一次状态变更时间
- *     history: [{ts, from, to, by, byNick}]  // 最近状态变更记录（上限 TASK_HISTORY_LIMIT）
+ *     history: [{ts, from, to, by, byNick}],  // 最近状态变更记录（上限 TASK_HISTORY_LIMIT）
+ *     deadlineRequest: null | {  // 延期申请：同一行动项至多一条待审申请；批准/拒绝后记录保留
+ *       id, newDeadline, reason,              // 申请的新截止时间（ms）与理由
+ *       status,            // pending(待审)|approved(已批准/已生效)|rejected(已拒绝)
+ *       by, byNick, ts,    // 申请人与申请时间
+ *       reviewedBy, reviewedNick, reviewedAt  // 审批人与审批时间（pending 时为 null）
+ *     }
  *   }>,
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
@@ -690,9 +712,17 @@ const TASK_STATUS_TEXT = {
   rejected: '已拒绝'
 };
 
+/** 操作记录中的截止时间格式：MM-DD HH:mm */
+function formatDeadlineLog(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 /**
  * 行动项状态流转：更新状态并追加一条状态变更记录
  * （每个行动项保留最近 TASK_HISTORY_LIMIT 条，超出滚动淘汰）。
+ * 进入待确认/已完结状态时，待审延期申请随之清退（已批准/已拒绝的历史记录保留）。
  * 不做版本提交，由调用方负责最终的单次 commit（与议题结算的写法一致）。
  */
 function transitionTask(task, toStatus, by) {
@@ -703,6 +733,15 @@ function transitionTask(task, toStatus, by) {
   }
   task.status = toStatus;
   task.updatedAt = now;
+  // 待接受 <-> 处理中之间的流转（接受 / 退回）保留待审申请；其余流转一律清退
+  if (
+    task.deadlineRequest &&
+    task.deadlineRequest.status === 'pending' &&
+    toStatus !== 'pending' &&
+    toStatus !== 'active'
+  ) {
+    task.deadlineRequest = null;
+  }
 }
 
 /** 已完结行动项滚动淘汰：仅保留最近 TASK_RESOLVED_LIMIT 条（不触碰未完结项，不改变版本） */
@@ -718,6 +757,23 @@ function pruneTasks(room) {
   }
 }
 
+/** 延期申请快照视图（无申请时为 null） */
+function buildDeadlineRequestView(req) {
+  if (!req) return null;
+  return {
+    id: req.id,
+    status: req.status,
+    newDeadline: req.newDeadline,
+    reason: req.reason,
+    by: req.by,
+    byNick: req.byNick,
+    ts: req.ts,
+    reviewedBy: req.reviewedBy || null,
+    reviewedNick: req.reviewedNick || null,
+    reviewedAt: req.reviewedAt || null
+  };
+}
+
 /** 行动项快照视图：负责人昵称实时解析（已离开房间则用创建时留存的昵称） */
 function buildTaskView(room, task) {
   const assignee = room.participants.get(task.assigneeId);
@@ -731,7 +787,8 @@ function buildTaskView(room, task) {
     deadline: task.deadline,
     status: task.status,
     updatedAt: task.updatedAt,
-    history: task.history.map((h) => ({ ts: h.ts, from: h.from, to: h.to, by: h.by, byNick: h.byNick }))
+    history: task.history.map((h) => ({ ts: h.ts, from: h.from, to: h.to, by: h.by, byNick: h.byNick })),
+    deadlineRequest: buildDeadlineRequestView(task.deadlineRequest)
   };
 }
 
@@ -1078,6 +1135,9 @@ wss.on('connection', (ws) => {
         case 'task_complete':
         case 'task_confirm':
         case 'task_return':
+        case 'task_deadline_request':
+        case 'task_deadline_approve':
+        case 'task_deadline_reject':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -1838,7 +1898,8 @@ function handleCommand(ws, msg, room, pid, isHost) {
         deadline: Math.round(deadline),
         status: 'pending',
         updatedAt: now,
-        history: [{ ts: now, from: null, to: 'pending', by: pid, byNick: me.nick }]
+        history: [{ ts: now, from: null, to: 'pending', by: pid, byNick: me.nick }],
+        deadlineRequest: null
       };
       room.tasks.set(task.id, task);
       addLog(room, 'task', `主持人创建行动项「${title}」，负责人「${assignee.nick}」`);
@@ -1903,6 +1964,105 @@ function handleCommand(ws, msg, room, pid, isHost) {
           ? `主持人确认行动项「${task.title}」已完成`
           : `主持人将行动项「${task.title}」退回处理中`
       );
+      return commit(room, { undoReason: 'task_changed' });
+    }
+
+    case 'task_deadline_request': {
+      if (!guardVersion(ws, msg, room)) return;
+      const task = room.tasks.get(String(msg.taskId || ''));
+      if (!task) return sendError(ws, '行动项不存在', 'NO_TASK', room);
+      // 身份校验：仅负责人可提交延期申请
+      if (task.assigneeId !== pid) {
+        return sendError(ws, '只有该行动项的负责人可以申请延期', 'TASK_NOT_YOURS', room);
+      }
+      // 状态校验：仅待接受 / 处理中可申请
+      if (task.status !== 'pending' && task.status !== 'active') {
+        return sendError(
+          ws,
+          `行动项当前状态为「${TASK_STATUS_TEXT[task.status]}」，无法申请延期`,
+          'BAD_TASK_STATE',
+          room
+        );
+      }
+      // 同一行动项仅保留一条待审申请
+      if (task.deadlineRequest && task.deadlineRequest.status === 'pending') {
+        return sendError(ws, '该行动项已有一条待审的延期申请，请等待主持人审批', 'DEADLINE_REQUEST_PENDING', room);
+      }
+      const reason = String(msg.reason ?? '').trim().slice(0, TASK_DEADLINE_REASON_MAX);
+      if (!reason) {
+        return sendError(ws, '请填写延期理由', 'NO_DEADLINE_REASON', room);
+      }
+      const newDeadline = Number(msg.newDeadline);
+      const now = Date.now();
+      if (
+        !Number.isFinite(newDeadline) ||
+        newDeadline < now - TASK_DEADLINE_GRACE_MS ||
+        newDeadline > now + TASK_MAX_AHEAD_MS
+      ) {
+        return sendError(ws, '新的截止时间无效（须为将来一年内的时间）', 'BAD_DEADLINE', room);
+      }
+      if (newDeadline <= task.deadline) {
+        return sendError(ws, '新的截止时间必须晚于当前截止时间', 'BAD_DEADLINE', room);
+      }
+      task.deadlineRequest = {
+        id: genId('dr_'),
+        newDeadline: Math.round(newDeadline),
+        reason,
+        status: 'pending',
+        by: pid,
+        byNick: me.nick,
+        ts: now,
+        reviewedBy: null,
+        reviewedNick: null,
+        reviewedAt: null
+      };
+      addLog(
+        room,
+        'task',
+        `「${me.nick}」为行动项「${task.title}」申请延期至 ${formatDeadlineLog(newDeadline)}，理由：${reason}`
+      );
+      return commit(room, { undoReason: 'task_changed' });
+    }
+
+    case 'task_deadline_approve':
+    case 'task_deadline_reject': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const task = room.tasks.get(String(msg.taskId || ''));
+      if (!task) return sendError(ws, '行动项不存在', 'NO_TASK', room);
+      const req = task.deadlineRequest;
+      // 审批目标必须是一条待审申请（不存在 / 已批准 / 已拒绝一律拒绝）
+      if (!req || req.status !== 'pending') {
+        return sendError(ws, '该行动项没有待审批的延期申请', 'DEADLINE_REQUEST_NOT_PENDING', room);
+      }
+      const applicantNick = room.participants.get(req.by)?.nick ?? req.byNick;
+      const now = Date.now();
+      if (msg.type === 'task_deadline_approve') {
+        // 批准：同一次同步状态变更内原子更新 deadline 并标记已生效，无命令可插入
+        const oldDeadline = task.deadline;
+        task.deadline = req.newDeadline;
+        req.status = 'approved';
+        req.reviewedBy = pid;
+        req.reviewedNick = me.nick;
+        req.reviewedAt = now;
+        addLog(
+          room,
+          'task',
+          `主持人「${me.nick}」批准了「${applicantNick}」对行动项「${task.title}」的延期申请：` +
+            `截止时间 ${formatDeadlineLog(oldDeadline)} → ${formatDeadlineLog(req.newDeadline)}`
+        );
+      } else {
+        // 拒绝：申请记录与理由保留，不改动 deadline
+        req.status = 'rejected';
+        req.reviewedBy = pid;
+        req.reviewedNick = me.nick;
+        req.reviewedAt = now;
+        addLog(
+          room,
+          'task',
+          `主持人「${me.nick}」拒绝了「${applicantNick}」对行动项「${task.title}」的延期申请` +
+            `（申请延至 ${formatDeadlineLog(req.newDeadline)}），理由：${req.reason}`
+        );
+      }
       return commit(room, { undoReason: 'task_changed' });
     }
   }

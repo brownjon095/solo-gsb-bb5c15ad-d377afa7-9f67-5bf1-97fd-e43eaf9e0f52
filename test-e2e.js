@@ -1686,6 +1686,238 @@ async function main() {
     await h.close(); await g1b.close(); await g2.close();
   }
 
+  // ===========================================================================
+  // 行动项延期申请（负责人申请 -> 主持人批准/拒绝；版本守卫与唯一性）
+  // ===========================================================================
+  {
+    const created = await createRoom('延期主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '延甲');
+    const g2 = await guestJoin(created.room, '延乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    await waitStable(h, [g1, g2]);
+
+    const deadline0 = Date.now() + 3600000;
+    h.send({ type: 'task_create', version: h.v, participantId: id1, title: '订会议室', deadline: deadline0 });
+    await h.waitFor((c) => c.snapshot.tasks && c.snapshot.tasks.length === 1);
+    const taskId = h.snapshot.tasks[0].id;
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest, null, '新行动项无延期申请');
+
+    // 27a. 申请校验：不存在任务 / 非负责人 / 空理由 / 非法或不晚于当前的截止时间 / 过期版本
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_deadline_request', taskId: 'tk_ghost', newDeadline: Date.now() + 7200000, reason: '测试' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_TASK');
+
+    g2.lastError = null;
+    await guestSend(h, g2, { type: 'task_deadline_request', taskId, newDeadline: Date.now() + 7200000, reason: '我也想延' });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'TASK_NOT_YOURS');
+
+    h.lastError = null;
+    h.send({ type: 'task_deadline_request', version: h.v, taskId, newDeadline: Date.now() + 7200000, reason: '主持人越权' });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'TASK_NOT_YOURS');
+
+    for (const badReason of ['', '   ']) {
+      g1.lastError = null;
+      await guestSend(h, g1, { type: 'task_deadline_request', taskId, newDeadline: Date.now() + 7200000, reason: badReason });
+      await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_DEADLINE_REASON');
+    }
+
+    for (const badDeadline of [deadline0 - 1000, deadline0, Date.now() - 3600000, Date.now() + 400 * 24 * 3600 * 1000, 'abc']) {
+      g1.lastError = null;
+      await guestSend(h, g1, { type: 'task_deadline_request', taskId, newDeadline: badDeadline, reason: '时间非法' });
+      await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DEADLINE');
+    }
+
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'task_deadline_request', version: g1.v - 1, taskId, newDeadline: Date.now() + 7200000, reason: '过期版本' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(g1.lastError.snapshot.version, h.snapshot.version, '过期申请返回最新快照');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest, null, '被拒申请不得写入');
+
+    // 27b. 合法申请：快照下发待审申请（申请人/时间/新截止/理由），操作记录含申请人与理由
+    const newDeadline1 = Date.now() + 2 * 3600000;
+    g1.send({ type: 'task_deadline_request', version: g1.v, taskId, newDeadline: newDeadline1, reason: '供应商还没回复，需要再等一天' });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'pending');
+    let req = h.snapshot.tasks[0].deadlineRequest;
+    assert.ok(/^dr_/.test(req.id), '快照需包含申请 id');
+    assert.strictEqual(req.newDeadline, newDeadline1);
+    assert.strictEqual(req.reason, '供应商还没回复，需要再等一天');
+    assert.strictEqual(req.by, id1);
+    assert.strictEqual(req.byNick, '延甲');
+    assert.ok(req.ts > 0);
+    assert.strictEqual(req.reviewedBy, null);
+    assert.strictEqual(req.reviewedAt, null);
+    assert.strictEqual(h.snapshot.tasks[0].deadline, deadline0, '待审期间 deadline 不变');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /申请延期/.test(l.text) && /供应商还没回复/.test(l.text)),
+      '申请操作记录须写入理由');
+    assert.ok(h.snapshot.logs.some((l) => /延甲/.test(l.text)), '申请操作记录须写入申请人');
+    const reqId = req.id;
+
+    // 27c. 同一事项仅保留一条待审申请：重复提交 -> DEADLINE_REQUEST_PENDING
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_deadline_request', taskId, newDeadline: Date.now() + 3 * 3600000, reason: '再试试' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'DEADLINE_REQUEST_PENDING');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.id, reqId, '重复申请不得替换待审申请');
+
+    // 27d. 审批校验：非主持人 / 无待审申请 / 过期版本
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_deadline_approve', taskId });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    h.lastError = null;
+    h.send({ type: 'task_deadline_approve', version: h.v, taskId: 'tk_none' });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_TASK');
+
+    h.lastError = null;
+    h.send({ type: 'task_deadline_approve', version: h.v - 1, taskId });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.lastError.snapshot.version, h.snapshot.version);
+    assert.strictEqual(h.snapshot.tasks[0].deadline, deadline0, '过期批准不得更新 deadline');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.status, 'pending');
+
+    // 27e. 拒绝：deadline 不变，申请标记 rejected 且理由保留，写入审批人与时间
+    h.send({ type: 'task_deadline_reject', version: h.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'rejected');
+    req = h.snapshot.tasks[0].deadlineRequest;
+    assert.strictEqual(req.id, reqId);
+    assert.strictEqual(req.reason, '供应商还没回复，需要再等一天', '拒绝后理由保留');
+    assert.strictEqual(req.newDeadline, newDeadline1);
+    assert.strictEqual(req.reviewedBy, h.joined.you.id);
+    assert.ok(req.reviewedNick && req.reviewedAt > 0, '拒绝须记录审批人与时间');
+    assert.strictEqual(h.snapshot.tasks[0].deadline, deadline0, '拒绝不改变 deadline');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /拒绝了/.test(l.text) && /延甲/.test(l.text)),
+      '拒绝记录须含申请人');
+
+    // 已拒绝后再审批 -> DEADLINE_REQUEST_NOT_PENDING
+    h.lastError = null;
+    h.send({ type: 'task_deadline_approve', version: h.v, taskId });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'DEADLINE_REQUEST_NOT_PENDING');
+
+    // 27f. 拒绝后负责人可重新申请（同一事项再次只有一条待审）
+    const newDeadline2 = Date.now() + 3 * 3600000;
+    g1.send({ type: 'task_deadline_request', version: g1.v, taskId, newDeadline: newDeadline2, reason: '这次材料齐了' });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'pending'
+      && c.snapshot.tasks[0].deadlineRequest.reason === '这次材料齐了');
+
+    // 接受事项（待接受 -> 处理中）：待审申请保留
+    g1.send({ type: 'task_accept', version: g1.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'active');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.status, 'pending', '接受后待审申请保留');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.newDeadline, newDeadline2);
+
+    // 27g. 批准：同一次提交内原子更新 deadline 并标记 approved（已生效），写入审批人与时间
+    h.send({ type: 'task_deadline_approve', version: h.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadline === newDeadline2
+      && c.snapshot.tasks[0].deadlineRequest.status === 'approved');
+    req = h.snapshot.tasks[0].deadlineRequest;
+    assert.strictEqual(req.status, 'approved');
+    assert.strictEqual(req.newDeadline, newDeadline2);
+    assert.strictEqual(req.reason, '这次材料齐了');
+    assert.strictEqual(req.reviewedBy, h.joined.you.id);
+    assert.ok(req.reviewedNick && req.reviewedAt > 0, '批准须记录审批人与时间');
+    assert.strictEqual(h.snapshot.tasks[0].status, 'active', '批准不改变行动项状态');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /批准了/.test(l.text) && /延甲/.test(l.text)),
+      '批准记录须含申请人与审批事实');
+
+    // 已生效的申请不能重复审批
+    h.lastError = null;
+    h.send({ type: 'task_deadline_reject', version: h.v, taskId });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'DEADLINE_REQUEST_NOT_PENDING');
+    assert.strictEqual(h.snapshot.tasks[0].deadline, newDeadline2, '重复审批不得改动 deadline');
+
+    // 27h. 处理中可再次申请延期（在已批准之后）
+    const newDeadline3 = newDeadline2 + 3600000;
+    g1.send({ type: 'task_deadline_request', version: g1.v, taskId, newDeadline: newDeadline3, reason: '还要再延' });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'pending'
+      && c.snapshot.tasks[0].deadlineRequest.newDeadline === newDeadline3);
+
+    // 27i. 标记完成（处理中 -> 待确认）自动清退待审申请；主持人拒绝/批准均无目标
+    g1.send({ type: 'task_complete', version: g1.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'review'
+      && c.snapshot.tasks[0].deadlineRequest === null);
+    h.lastError = null;
+    h.send({ type: 'task_deadline_approve', version: h.v, taskId });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'DEADLINE_REQUEST_NOT_PENDING');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_deadline_request', taskId, newDeadline: newDeadline3 + 1, reason: '待确认不能申' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+
+    // 27j. 退回处理中后仍可申请（清退后重新申请正常）
+    h.send({ type: 'task_return', version: h.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'active');
+    g1.send({ type: 'task_deadline_request', version: g1.v, taskId, newDeadline: newDeadline3 + 1000, reason: '退回后重提' });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'pending');
+    h.send({ type: 'task_deadline_reject', version: h.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].deadlineRequest
+      && c.snapshot.tasks[0].deadlineRequest.status === 'rejected');
+
+    // 27k. 已完成（终态）保留最近一次申请记录（理由仍可展示），且不能再申请/审批
+    g1.send({ type: 'task_complete', version: g1.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'review');
+    h.send({ type: 'task_confirm', version: h.v, taskId });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'done');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.status, 'rejected', '终态保留已拒绝的申请记录与理由');
+    assert.strictEqual(h.snapshot.tasks[0].deadlineRequest.reason, '退回后重提');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_deadline_request', taskId, newDeadline: Date.now() + 999999, reason: '已完成' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+
+    // 27l. 待接受事项的申请：批准原子性——待审期间其他人的命令推进版本后，旧批准版本过期
+    const dl2 = Date.now() + 3600000;
+    h.send({ type: 'task_create', version: h.v, participantId: id2, title: '打印材料', deadline: dl2 });
+    await h.waitFor((c) => c.snapshot.tasks.length === 2);
+    const task2Id = h.snapshot.tasks.find((t) => t.title === '打印材料').id;
+    const nd2 = Date.now() + 5 * 3600000;
+    g2.send({ type: 'task_deadline_request', version: g2.v, taskId: task2Id, newDeadline: nd2, reason: '打印机坏了' });
+    await h.waitFor((c) => {
+      const t = c.snapshot.tasks.find((x) => x.id === task2Id);
+      return t && t.deadlineRequest && t.deadlineRequest.status === 'pending';
+    });
+    // 用 g1 的无关状态变更（申请/取消发言）推进版本，主持人持旧版本批准 -> STALE_VERSION
+    const vStale = h.v;
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.v === vStale + 1);
+    h.lastError = null;
+    h.send({ type: 'task_deadline_approve', version: vStale, taskId: task2Id });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    const t2 = h.snapshot.tasks.find((x) => x.id === task2Id);
+    assert.strictEqual(t2.deadline, dl2, '过期批准不得更新截止时间');
+    assert.strictEqual(t2.deadlineRequest.status, 'pending', '过期批准后申请仍待审');
+    // 同步到最新版本后批准成功
+    h.send({ type: 'task_deadline_approve', version: h.v, taskId: task2Id });
+    await h.waitFor((c) => {
+      const t = c.snapshot.tasks.find((x) => x.id === task2Id);
+      return t && t.deadline === nd2 && t.deadlineRequest.status === 'approved';
+    });
+
+    // 27m. 断线重连后延期申请记录完整恢复
+    await g1.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id1);
+      return p && p.online === false;
+    });
+    const g1b = new Client();
+    await g1b.open();
+    g1b.send({ type: 'join', room: created.room, nick: '延甲', participantId: id1, secret: g1.joined.you.secret });
+    await g1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    const restored = g1b.snapshot.tasks.find((t) => t.id === task2Id);
+    assert.ok(restored.deadlineRequest, '重连后恢复延期申请记录');
+    assert.strictEqual(restored.deadlineRequest.status, 'approved');
+    assert.strictEqual(restored.deadlineRequest.reason, '打印机坏了');
+    assert.strictEqual(restored.deadlineRequest.newDeadline, nd2);
+    assert.ok(restored.deadlineRequest.reviewedNick && restored.deadlineRequest.reviewedAt);
+    assert.strictEqual(restored.deadline, nd2, '重连后已生效的新截止时间恢复');
+
+    await h.close(); await g1b.close(); await g2.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();

@@ -30,6 +30,10 @@
   负责人在线**接受 / 拒绝**，接受后可**标记完成**，主持人再**确认完成**或**退回处理中**。
   看板按**待接受 / 处理中 / 待确认 / 已完成·已拒绝**四组展示，未完结项按截止时间排序并
   红色标注逾期；每项卡片保留**最近状态变更记录**（时间 + 操作者 + 动作）。
+  负责人还可对**待接受 / 处理中**的事项**申请延期**（新的截止时间 + 理由），
+  **同一事项仅保留一条待审申请**；主持人在卡片上**批准 / 拒绝**：
+  批准在一次原子提交内更新截止时间并标记「已生效」，拒绝则保留申请理由；
+  申请与审批操作均写入操作记录（申请人 / 审批人 / 时间）。
   全部流转复用版本守卫并**校验操作者身份与当前状态**——多端重复确认、越权跳转都会被
   拒绝并返回最新快照；断线重连后行动项状态完整恢复；
 - 主持人上述四类操作支持**安全撤销**：只回滚受影响的队列位置与当前发言，
@@ -45,24 +49,38 @@
 
 ## 快速开始（Docker）
 
-需要安装 Docker（含 Compose v2）。
+需要安装 Docker（含 Compose v2，即随 Docker Desktop / Docker Engine 一起安装的
+`docker compose` 插件）。以下命令均在项目根目录（含 `compose.yaml` 的目录）执行。
+
+### 使用 Docker Compose（推荐）
+
+构建镜像并在前台启动（可直接看到服务日志，`Ctrl+C` 停止）：
 
 ```bash
 docker compose up --build
+```
+
+后台启动 / 查看日志 / 停止：
+
+```bash
+docker compose up --build -d   # 后台运行
+docker compose logs -f         # 跟踪服务日志
+docker compose down            # 停止并移除容器
 ```
 
 该命令会自动完成依赖安装、镜像构建并启动服务。启动后浏览器访问：
 
 > **http://localhost:3000**
 
-主持人打开页面 → 「创建房间」→ 把 6 位房间码（或「复制邀请链接」）投给参与者；
-参与者打开同一地址输入房间码和昵称即可加入。
-
-停止服务：
+健康检查：服务内置 `GET /healthz`（容器也配置了 Docker 级 HEALTHCHECK）：
 
 ```bash
-docker compose down
+curl http://localhost:3000/healthz
+# {"ok":true,"rooms":0}
 ```
+
+主持人打开页面 → 「创建房间」→ 把 6 位房间码（或「复制邀请链接」）投给参与者；
+参与者打开同一地址输入房间码和昵称即可加入。
 
 > 若希望使用其他宿主机端口（例如 8080）：
 >
@@ -71,6 +89,31 @@ docker compose down
 > ```
 >
 > 然后访问 http://localhost:8080
+>
+> 修改配置也可直接编辑 `compose.yaml` 的 `environment` 段（见下方「配置项」），
+> 改动后重新执行 `docker compose up --build` 生效。
+
+### 仅使用 Docker（不使用 Compose）
+
+```bash
+# 构建镜像
+docker build -t speak-queue:latest .
+
+# 启动容器：宿主机 3000 端口 -> 容器 3000 端口，容器异常退出时自动重启
+docker run -d --name speak-queue \
+  -p 3000:3000 \
+  -e PORT=3000 \
+  --restart unless-stopped \
+  speak-queue:latest
+
+# 查看日志 / 健康状态 / 停止删除
+docker logs -f speak-queue
+curl http://localhost:3000/healthz
+docker stop speak-queue && docker rm speak-queue
+```
+
+需要覆盖默认配置时，追加 `-e 变量名=值`（如 `-e ROLLCALL_TIMEOUT_MS=15000`），
+完整变量见下方「配置项」。
 
 ---
 
@@ -185,6 +228,14 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
     升序排列，**逾期项红色标注**剩余时间；已完结组按最近更新排序。
   - 负责人标记完成后，行动项进入「待确认」组，主持人可 **✅ 确认完成**（进入已完成）
     或 **↩ 退回处理中**（打回给负责人继续处理）。
+  - **延期申请**：负责人在「待接受 / 处理中」卡片上点 **📅 申请延期**，填写
+    **新的截止时间**（须晚于当前截止时间）与**延期理由**后提交：
+    - 同一事项同一时刻**仅保留一条待审申请**，卡片显示「延期待审」（申请人、新截止时间、理由），
+      主持人卡片上出现 **✅ 批准延期** / **拒绝** 按钮。
+    - 主持人**批准**：截止时间在一次原子提交内更新，申请标记为「延期已生效」并保留审批人与时间；
+      **拒绝**：截止时间不变，申请标记为「延期已拒绝」，理由仍保留在卡片上；拒绝后负责人可重新申请。
+    - 事项进入「待确认 / 已完成·已拒绝」时未处理的待审申请自动清退；已批准 / 已拒绝的
+    申请记录随行动项保留。申请与审批都写入操作记录（含申请人、审批人与时间）。
   - 每项卡片底部保留**最近一条状态变更记录**（时间 + 操作者 + 动作），完整记录随快照下发。
   - 一键清空**不会**清除行动项（行动项有独立的生命周期）。
 
@@ -217,6 +268,9 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
   或 **拒绝**；接受后进入「处理中」，完成后点 **✔ 标记完成** 进入「待确认」，等待主持人
   确认；若被主持人退回则回到「处理中」并弹出提示。卡片上实时显示截止倒计时，
   逾期红色标注；断线重连后行动项状态与操作入口自动恢复。
+  - **申请延期**：在「待接受 / 处理中」卡片上点 **📅 申请延期**，选择**晚于当前截止时间**
+    的新时间并填写**理由**后提交；同一事项已有待审申请时不能重复提交，主持人批准 / 拒绝后
+    你会收到提示，被拒绝后可修改内容重新申请。
 
 ### 投屏建议
 
@@ -258,6 +312,9 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 { "type": "task_complete","version": 12, "taskId": "tk_xxx" }           // 负责人：标记完成（处理中 -> 待确认）
 { "type": "task_confirm", "version": 12, "taskId": "tk_xxx" }           // 主持人：确认完成（待确认 -> 已完成）
 { "type": "task_return",  "version": 12, "taskId": "tk_xxx" }           // 主持人：退回处理中（待确认 -> 处理中）
+{ "type": "task_deadline_request", "version": 12, "taskId": "tk_xxx", "newDeadline": 1726…, "reason": "供应商未回复" }  // 负责人：延期申请（仅待接受/处理中）
+{ "type": "task_deadline_approve", "version": 12, "taskId": "tk_xxx" }  // 主持人：批准（原子更新 deadline 并标记已生效）
+{ "type": "task_deadline_reject",  "version": 12, "taskId": "tk_xxx" }  // 主持人：拒绝（理由保留）
 ```
 
 房间快照携带 `undo` 字段，描述最近一次主持人操作的可逆状态：
@@ -436,7 +493,21 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
   "updatedAt": 1726…,      // 最近一次状态变更时间
   "history": [             // 最近状态变更记录（最多 TASK_HISTORY_LIMIT 条）
     { "ts": 1726…, "from": null, "to": "pending", "by": "p_host", "byNick": "主持" }
-  ]
+  ],
+  "deadlineRequest": null  // 延期申请（无申请记录时为 null）
+}
+```
+
+`deadlineRequest` 非空时的结构：
+
+```
+{
+  "id": "dr_…",
+  "status": "pending",     // pending(待审) | approved(已批准/已生效) | rejected(已拒绝)
+  "newDeadline": 1726…,    // 申请的新截止时间（ms 时间戳）
+  "reason": "供应商还没回复，需要再等一天",
+  "by": "p_a", "byNick": "阿东", "ts": 1726…,          // 申请人与申请时间
+  "reviewedBy": null, "reviewedNick": null, "reviewedAt": null  // 审批人与审批时间（pending 时为 null）
 }
 ```
 
@@ -449,6 +520,18 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 - `task_create` 的 `deadline` 为 ms 时间戳，须为将来时间（容忍 5 分钟客户端时钟偏差）
   且不超过 366 天，非法返回 `BAD_DEADLINE`；负责人须为当前房间成员（否则
   `NO_PARTICIPANT`）；未完结行动项达到 `TASK_MAX_OPEN` 返回 `TASK_LIMIT`。
+- **延期申请** `task_deadline_request` 仅负责人可发，且仅当状态为
+  `pending / active`（否则 `BAD_TASK_STATE`）；`reason` 为空返回
+  `NO_DEADLINE_REASON`；`newDeadline` 非法或不晚于当前 `deadline` 返回
+  `BAD_DEADLINE`；同一行动项已有待审申请返回 `DEADLINE_REQUEST_PENDING`——
+  均附最新快照且不改变版本。
+- `task_deadline_approve / task_deadline_reject` 仅主持人可发，目标必须是一条
+  `pending` 申请，否则返回 `DEADLINE_REQUEST_NOT_PENDING`。批准在同一次同步状态
+  变更内把 `deadline` 更新为 `newDeadline` 并把申请标记为 `approved`（已生效，
+  记录审批人与时间）；拒绝不改动 `deadline`，申请标记为 `rejected`，理由保留。
+  行动项进入 `review / done / rejected` 时，未处理的待审申请自动清退；
+  已批准 / 已拒绝的申请记录随行动项保留。申请与审批均写入 `kind:"task"` 的操作记录
+  （含申请人、审批人与时间），并使挂起的安全撤销失效（`undo.reason = "task_changed"`）。
 - 每个行动项保留最近 `TASK_HISTORY_LIMIT` 条状态变更记录随快照下发；已完结行动项
   仅保留最近 `TASK_RESOLVED_LIMIT` 条（滚动淘汰）。行动项变更同样使挂起的安全撤销
   失效（`undo.reason = "task_changed"`）。行动项无定时任务，断线重连后凭快照完整恢复。
