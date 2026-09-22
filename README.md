@@ -28,10 +28,12 @@
   **旧回调直接忽略，只结算当前议题**；断线重连后票数、剩余时间与结算结果连续恢复；
 - **行动项看板**：主持人从**当前成员**中指定**负责人**，填写事项与**截止时间**创建行动项；
   负责人在线**接受 / 拒绝**，接受后可**标记完成**，主持人再**确认完成**或**退回处理中**。
-  看板按**待接受 / 处理中 / 待确认 / 已完成·已拒绝**四组展示，未完结项按截止时间排序并
-  红色标注逾期；每项卡片保留**最近状态变更记录**（时间 + 操作者 + 动作）。
-  全部流转复用版本守卫并**校验操作者身份与当前状态**——多端重复确认、越权跳转都会被
-  拒绝并返回最新快照；断线重连后行动项状态完整恢复；
+  负责人可对待接受 / 处理中事项**申请延期**（新截止时间 + 理由），同一事项仅保留一条待审申请，
+  主持人**批准 / 拒绝**：批准原子更新截止时间并标记已生效，拒绝保留理由；事项进入终态时
+  未审结申请自动作废。看板按**待接受 / 处理中 / 待确认 / 已完成·已拒绝**四组展示，未完结项按
+  截止时间排序并红色标注逾期；每项卡片展示**延期申请状态、理由、申请人/审批人**与最近状态变更记录
+  （时间 + 操作者 + 动作）。全部流转复用版本守卫并**校验操作者身份与当前状态**——多端重复确认、
+  越权跳转都会被拒绝并返回最新快照；断线重连后行动项状态完整恢复；
 - 主持人上述四类操作支持**安全撤销**：只回滚受影响的队列位置与当前发言，
   之后出现任何版本化变更即立即失效，撤销记录全程留下可见审计；
 - 大屏展示当前发言人、大号**发言计时**、发言队列、在场成员与**操作记录**；
@@ -45,32 +47,83 @@
 
 ## 快速开始（Docker）
 
-需要安装 Docker（含 Compose v2）。
+需要安装 Docker（含 Compose v2，即随 Docker Desktop 一起安装的 `docker compose` 插件；
+Linux 单独安装时请确认 `docker compose version` 可正常输出）。
+
+### 启动服务
+
+在项目根目录（含 `compose.yaml` 与 `Dockerfile` 的目录）执行：
 
 ```bash
 docker compose up --build
 ```
 
-该命令会自动完成依赖安装、镜像构建并启动服务。启动后浏览器访问：
+该命令会自动完成依赖安装（`npm ci`）、镜像构建并以前台方式启动服务，
+看到 `发言席位服务已启动: http://localhost:3000` 即表示就绪。
+启动后浏览器访问：
 
 > **http://localhost:3000**
 
 主持人打开页面 → 「创建房间」→ 把 6 位房间码（或「复制邀请链接」）投给参与者；
 参与者打开同一地址输入房间码和昵称即可加入。
 
-停止服务：
+### 停止服务
+
+- 前台运行时直接按 `Ctrl + C` 停止容器；如需连同容器一起移除：
 
 ```bash
 docker compose down
 ```
 
-> 若希望使用其他宿主机端口（例如 8080）：
+### 后台运行 / 查看日志 / 重新构建
+
+```bash
+docker compose up --build -d   # 后台（detached）方式启动
+docker compose ps              # 查看容器运行状态
+docker compose logs -f         # 实时跟踪服务日志
+docker compose restart         # 重启服务（不重新构建）
+docker compose up --build -d   # 修改代码后重新构建并启动
+docker compose down            # 停止并移除容器（镜像保留）
+```
+
+> compose 已配置 `restart: unless-stopped`：容器异常退出或宿主机重启后会自动拉起，
+> 执行 `docker compose stop` 后才会保持停止。
+
+### 使用其他宿主机端口
+
+容器内固定监听 3000 端口，宿主机映射端口可用 `PORT` 变量覆盖（例如改用 8080）：
+
+```bash
+PORT=8080 docker compose up --build
+```
+
+然后访问 http://localhost:8080 。
+
+> Windows PowerShell 下环境变量写法不同：
 >
-> ```bash
-> PORT=8080 docker compose up --build
+> ```powershell
+> $env:PORT=8080; docker compose up --build
 > ```
->
-> 然后访问 http://localhost:8080
+
+### 不使用 Compose：直接用 Docker 运行
+
+```bash
+docker build -t speak-queue:latest .
+docker run --rm -p 3000:3000 --name speak-queue speak-queue:latest
+```
+
+自定义端口与配置（更多环境变量见下文「配置项」）：
+
+```bash
+docker run -d --name speak-queue \
+  -p 8080:3000 \
+  -e ROOM_TTL_MS=14400000 \
+  -e LOG_LIMIT=500 \
+  speak-queue:latest
+```
+
+健康检查：镜像内置 `/healthz` 探针（`http://localhost:3000/healthz` 返回
+`{"ok":true,...}`），容器编排与外部探活均可直接使用。
 
 ---
 
@@ -185,6 +238,9 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
     升序排列，**逾期项红色标注**剩余时间；已完结组按最近更新排序。
   - 负责人标记完成后，行动项进入「待确认」组，主持人可 **✅ 确认完成**（进入已完成）
     或 **↩ 退回处理中**（打回给负责人继续处理）。
+  - 负责人提交**延期申请**后，卡片显示橙色「延期待审批」区块（新截止时间、理由、申请人与时间），
+    主持人可 **✅ 批准延期**（截止时间原子更新、申请标记已生效）或 **拒绝延期**（保留理由，
+    截止时间不变）；事项确认完成 / 被拒绝时，未审结申请自动作废。
   - 每项卡片底部保留**最近一条状态变更记录**（时间 + 操作者 + 动作），完整记录随快照下发。
   - 一键清空**不会**清除行动项（行动项有独立的生命周期）。
 
@@ -215,8 +271,11 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
   剩余时间自动恢复。
 - **行动项**：主持人指派给你的行动项会出现在「待接受」组（并弹出提示），可 **接受**
   或 **拒绝**；接受后进入「处理中」，完成后点 **✔ 标记完成** 进入「待确认」，等待主持人
-  确认；若被主持人退回则回到「处理中」并弹出提示。卡片上实时显示截止倒计时，
-  逾期红色标注；断线重连后行动项状态与操作入口自动恢复。
+  确认；若被主持人退回则回到「处理中」并弹出提示。待接受 / 处理中可点卡片上的
+  **⏱ 申请延期**，填写新的截止时间与理由提交；同一事项仅保留一条待审申请，被批准后
+  截止时间立即更新（绿色「延期已批准」），被拒绝则保留理由且截止时间不变，可重新申请；
+  若事项已完结，未审结申请会自动作废。卡片上实时显示截止倒计时，逾期红色标注；
+  断线重连后行动项状态、延期申请与操作入口自动恢复。
 
 ### 投屏建议
 
@@ -258,6 +317,9 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 { "type": "task_complete","version": 12, "taskId": "tk_xxx" }           // 负责人：标记完成（处理中 -> 待确认）
 { "type": "task_confirm", "version": 12, "taskId": "tk_xxx" }           // 主持人：确认完成（待确认 -> 已完成）
 { "type": "task_return",  "version": 12, "taskId": "tk_xxx" }           // 主持人：退回处理中（待确认 -> 处理中）
+{ "type": "task_deadline_request", "version": 12, "taskId": "tk_xxx", "deadline": 1726…, "reason": "…" }  // 负责人：提交延期申请（待接受/处理中）
+{ "type": "task_deadline_approve", "version": 12, "taskId": "tk_xxx" }  // 主持人：批准延期（原子更新截止时间）
+{ "type": "task_deadline_reject",  "version": 12, "taskId": "tk_xxx" }  // 主持人：拒绝延期（保留理由）
 ```
 
 房间快照携带 `undo` 字段，描述最近一次主持人操作的可逆状态：
@@ -433,15 +495,34 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
   "createdBy": "p_host", "createdAt": 1726…, "deadline": 1726…,
   "status": "pending",     // pending(待接受) | active(处理中) | review(待确认)
                            // | done(已完成) | rejected(已拒绝)
-  "updatedAt": 1726…,      // 最近一次状态变更时间
+  "updatedAt": 1726…,      // 最近一次状态变更时间（延期申请/审批也会更新）
+  "deadlineRequest": null, // 最近一次延期申请（null 表示从未申请），结构见下
   "history": [             // 最近状态变更记录（最多 TASK_HISTORY_LIMIT 条）
     { "ts": 1726…, "from": null, "to": "pending", "by": "p_host", "byNick": "主持" }
   ]
+}
+
+// task.deadlineRequest（同一事项仅保留最近一条；被新申请覆盖的是已审结的旧申请）
+{
+  "id": "dr_…",
+  "status": "pending",     // pending(待审批) | approved(已批准并生效) | rejected(已拒绝) | voided(已作废)
+  "newDeadline": 1726…,    // 申请的新截止时间（ms）
+  "reason": "依赖材料未到位",
+  "requestedBy": "p_a", "requestedByNick": "阿东", "requestedAt": 1726…,
+  "decidedBy": null,       // 审批人（批准/拒绝/作废时写入）
+  "decidedByNick": null, "decidedAt": null
 }
 ```
 
 - 状态机：`pending → active → review → done`；`pending` 可被负责人拒绝为 `rejected`；
   `review` 可被主持人退回 `active`。`done` / `rejected` 为终态，其余跳转一律拒绝。
+- **延期申请**：负责人可对 `pending` / `active` 事项提交 `task_deadline_request`
+  （新截止时间须为**将来一年内且晚于当前截止时间**，理由不能为空）；同一事项已有待审申请
+  返回 `TASK_REQUEST_PENDING`，新申请会覆盖上一条**已审结**申请。主持人对非待审申请批准 /
+  拒绝返回 `TASK_REQUEST_NONE`；批准在同一次同步变更中把 `deadline` 原子更新为申请值并把
+  申请标记为 `approved`（已生效），拒绝置为 `rejected` 且截止时间不变、理由完整保留。
+  事项进入终态（确认完成 / 负责人拒绝事项）时，仍待审的申请自动置为 `voided`
+  （`decidedBy` 记录触发终态的操作者）；进入 / 退回 `review` 不影响申请。
 - 全部命令严格校验 `version`（过期返回 `STALE_VERSION` + 最新快照）；负责人命令校验
   `assigneeId === 发送者`（否则 `TASK_NOT_YOURS`），主持人命令校验主持身份（否则
   `FORBIDDEN`）；当前状态不允许该流转时返回 `BAD_TASK_STATE` + 最新快照——
@@ -470,7 +551,7 @@ compose.yaml 的 `environment` 段可直接修改容器内配置；宿主机端�
 
 ```
 .
-├── server.js          # Express + WebSocket 服务端（房间、版本化命令、协商换位、限时发言、发言配额、点名接力、议题投票、行动项、记录、重连）
+├── server.js          # Express + WebSocket 服务端（房间、版本化命令、协商换位、限时发言、发言配额、点名接力、议题投票、行动项与延期申请、记录、重连）
 ├── public/
 │   ├── index.html     # 首页与房间视图
 │   ├── style.css      # 投屏优化样式
